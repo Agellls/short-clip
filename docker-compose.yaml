@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  clipper:
+    build: .
+    image: yt-clipper:latest
+    container_name: yt-clipper
+    restart: unless-stopped
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PORT=8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./clips:/app/clips
