@@ -24,9 +24,8 @@ COPY .env* ./
 # Create necessary directories
 RUN mkdir -p assets temp
 
-# Copy default background image (create a placeholder if not exists)
-# You should add your actual bg_default.jpg to assets/ folder
-COPY assets/bg_default.jpg assets/ 2>/dev/null || echo "Warning: bg_default.jpg not found"
+# Copy assets folder (will skip if doesn't exist)
+COPY assets/ assets/ 2>/dev/null || true
 
 # Expose port
 EXPOSE 8000
