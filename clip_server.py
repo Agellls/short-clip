@@ -100,6 +100,9 @@ class ClipRequest(BaseModel):
     end: float
     resolution: Optional[str] = None  # e.g. "1920x1080" or "1080x1920"
     background_image_url: Optional[str] = None  # ⭐ URL background image dari CDN
+    background_music_url: Optional[str] = None  # ⭐ URL musik dari storage/CDN
+    music_volume: Optional[float] = 0.3  # Volume musik (0.0-1.0), 0.3 = 30%
+    fade_music: Optional[bool] = True  # Fade in/out musik
 
 class ClipCaptionRequest(ClipRequest):
     model: Optional[str] = "small"   # local model size (tiny,base,small,medium,large) or "whisper-1" to prefer OpenAI
@@ -705,6 +708,8 @@ async def clip_endpoint(req: ClipRequest, background: BackgroundTasks):
     tmp_out_path = tmp_out.name; tmp_out.close()
     tmp_resized = None
     tmp_bg_image = None
+    tmp_music_path = None
+    tmp_with_music = None
 
     loop = asyncio.get_event_loop()
     try:
@@ -712,8 +717,9 @@ async def clip_endpoint(req: ClipRequest, background: BackgroundTasks):
         await loop.run_in_executor(None, run_ffmpeg_cut_local, tmp_download_path, start, duration, tmp_out_path)
     except Exception as e:
         for p in (tmp_download_path, tmp_out_path):
-            try: os.remove(p)
-            except Exception: pass
+            if p and os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
         logger.exception("yt-dlp or ffmpeg cut failed")
         raise HTTPException(status_code=500, detail=f"yt-dlp or ffmpeg failed: {e}")
 
@@ -743,22 +749,88 @@ async def clip_endpoint(req: ClipRequest, background: BackgroundTasks):
             final_output = tmp_out_path
     except ValueError as ve:
         for p in (tmp_download_path, tmp_out_path, tmp_resized, tmp_bg_image):
-            if p:
+            if p and os.path.exists(p):
                 try: os.remove(p)
                 except Exception: pass
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         for p in (tmp_download_path, tmp_out_path, tmp_resized, tmp_bg_image):
-            if p:
+            if p and os.path.exists(p):
                 try: os.remove(p)
                 except Exception: pass
         logger.exception("resize failed")
         raise HTTPException(status_code=500, detail=f"resize failed: {e}")
 
+    # ⭐ ADD BACKGROUND MUSIC (OPTIONAL)
+    final_video_path = final_output
+    if req.background_music_url:
+        try:
+            logger.info("Processing background music from URL: %s", req.background_music_url)
+            
+            # Download music file
+            music_ext = req.background_music_url.split('?')[0].split('.')[-1].lower()
+            if music_ext not in ['mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac']:
+                music_ext = 'mp3'
+            
+            fd_music, tmp_music_path = tempfile.mkstemp(suffix=f".{music_ext}")
+            os.close(fd_music)
+            
+            logger.info("Downloading music to: %s", tmp_music_path)
+            await loop.run_in_executor(None, download_music_file, req.background_music_url, tmp_music_path)
+            
+            # Add music to video
+            fd_with_music, tmp_with_music = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd_with_music)
+            
+            fade_duration = 2.0 if req.fade_music else 0.0
+            music_volume = float(req.music_volume) if req.music_volume is not None else 0.3
+            
+            logger.info("Adding music with volume=%.2f, fade=%.1fs", music_volume, fade_duration)
+            await loop.run_in_executor(
+                None,
+                add_background_music,
+                final_output,
+                tmp_music_path,
+                tmp_with_music,
+                music_volume,
+                fade_duration
+            )
+            
+            # Update final output to the one with music
+            final_video_path = tmp_with_music
+            logger.info("Background music added successfully to: %s", final_video_path)
+            
+        except Exception as e:
+            logger.exception("Failed to add background music: %s", e)
+            # Continue without music if failed, cleanup temp files
+            final_video_path = final_output
+            if tmp_music_path and os.path.exists(tmp_music_path):
+                try: 
+                    os.remove(tmp_music_path)
+                    tmp_music_path = None
+                except: pass
+            if tmp_with_music and os.path.exists(tmp_with_music):
+                try: 
+                    os.remove(tmp_with_music)
+                    tmp_with_music = None
+                except: pass
+
+    # Cleanup temp files
     background.add_task(remove_file_later, tmp_download_path)
-    background.add_task(remove_file_later, final_output)
-    filename = f"clip-{Path(final_output).stem}.mp4"
-    return FileResponse(final_output, media_type="video/mp4", filename=filename)
+    if tmp_bg_image and os.path.exists(tmp_bg_image):
+        background.add_task(remove_file_later, tmp_bg_image)
+    if tmp_music_path and os.path.exists(tmp_music_path):
+        background.add_task(remove_file_later, tmp_music_path)
+    
+    # If we created a video with music, clean the one without music
+    if tmp_with_music and final_video_path == tmp_with_music and final_output != final_video_path:
+        background.add_task(remove_file_later, final_output)
+    
+    # Clean final output after response is sent
+    background.add_task(remove_file_later, final_video_path)
+    
+    filename = f"clip-{Path(final_video_path).stem}.mp4"
+    return FileResponse(final_video_path, media_type="video/mp4", filename=filename)
 
 @app.post("/clip_with_caption")
 async def clip_with_caption_endpoint(req: ClipCaptionRequest, background: BackgroundTasks):
@@ -848,13 +920,13 @@ async def clip_with_caption_endpoint(req: ClipCaptionRequest, background: Backgr
             working_video_for_sub = tmp_video_path
     except ValueError as ve:
         for p in (tmp_video_path, tmp_wav_path, tmp_ass_path, out_final_path, tmp_video_resized if tmp_video_resized else "", tmp_bg_image):
-            if p:
+            if p and os.path.exists(p):
                 try: os.remove(p)
                 except Exception: pass
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         for p in (tmp_video_path, tmp_wav_path, tmp_ass_path, out_final_path, tmp_video_resized if tmp_video_resized else "", tmp_bg_image):
-            if p:
+            if p and os.path.exists(p):
                 try: os.remove(p)
                 except Exception: pass
         logger.exception("resize failed")
