@@ -24,8 +24,7 @@ COPY .env* ./
 # Create necessary directories
 RUN mkdir -p assets temp
 
-# Copy assets folder (will fail build if doesn't exist - remove if optional)
-COPY assets/ assets/
+# Assets folder will be mounted as volume or created at runtime
 
 # Expose port
 EXPOSE 8000

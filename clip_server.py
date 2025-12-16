@@ -54,6 +54,7 @@ from typing import List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel, HttpUrl
 from fastapi.responses import FileResponse
+import requests
 
 # load .env if available
 try:
@@ -70,6 +71,26 @@ logger = logging.getLogger("clip_server")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BG_IMAGE_PATH = os.path.abspath("assets/bg_default.jpg")
 
+# Create default background if it doesn't exist
+def ensure_default_background():
+    os.makedirs("assets", exist_ok=True)
+    if not os.path.exists(BG_IMAGE_PATH):
+        # Create a simple black background using ffmpeg
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"color=c=black:s=1920x1080:d=1",
+            "-frames:v", "1",
+            BG_IMAGE_PATH
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=10)
+            logger.info("Created default black background at %s", BG_IMAGE_PATH)
+        except Exception as e:
+            logger.warning("Could not create default background: %s", e)
+
+ensure_default_background()
+
 app = FastAPI(title="Clip + Caption Server (OpenAI-first, fallback local) - resizable")
 
 # ----------------- Request models -----------------
@@ -78,6 +99,7 @@ class ClipRequest(BaseModel):
     start: float
     end: float
     resolution: Optional[str] = None  # e.g. "1920x1080" or "1080x1920"
+    background_image_url: Optional[str] = None  # ⭐ URL background image dari CDN
 
 class ClipCaptionRequest(ClipRequest):
     model: Optional[str] = "small"   # local model size (tiny,base,small,medium,large) or "whisper-1" to prefer OpenAI
@@ -160,8 +182,27 @@ def resize_video_with_bg(
     """
     Resize video FIT (no crop) and fill empty area with background image.
     """
+    # Check if background exists, otherwise fallback to black padding
     if not os.path.exists(bg_image):
-        raise RuntimeError(f"Background image not found: {bg_image}")
+        logger.warning(f"Background image not found: {bg_image}, using black padding instead")
+        w, h = resolution
+        vf = (
+            f"scale=iw*min({w}/iw\\,{h}/ih):ih*min({w}/iw\\,{h}/ih),"
+            f"pad={w}:{h}:({w}-iw*min({w}/iw\\,{h}/ih))/2:({h}-ih*min({w}/iw\\,{h}/ih))/2:black"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-i", input_video,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "copy",
+            out_path
+        ]
+        cp = run_cmd(cmd, timeout=600)
+        if cp.returncode != 0:
+            logger.error("resize with black padding failed: %s", cp.stderr or cp.stdout)
+            raise RuntimeError("resize with black padding failed")
+        logger.info("Resized video with black padding to %dx%d -> %s", w, h, out_path)
+        return
 
     w, h = resolution
     bg = bg_image.replace("\\", "/")
@@ -305,6 +346,25 @@ def download_music_file(music_url: str, out_path: str):
         raise RuntimeError(f"Failed to download music: {e}")
 
 
+def download_image_file(image_url: str, out_path: str):
+    """
+    Download image file from URL (for background).
+    """
+    try:
+        logger.info("Downloading background image from: %s", image_url)
+        resp = requests.get(image_url, stream=True, timeout=60)
+        resp.raise_for_status()
+        
+        with open(out_path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        logger.info("Downloaded background image to %s", out_path)
+    except Exception as e:
+        logger.error("Failed to download background image: %s", e)
+        raise RuntimeError(f"Failed to download background image: {e}")
+
+
 def add_background_music(
     input_video: str,
     music_path: str,
@@ -407,7 +467,6 @@ def transcribe_audio_local(audio_path: str, model_size: str = "small", language:
         raise RuntimeError("No local ASR backend installed (install faster-whisper or openai-whisper)")
 
 # ----------------- OpenAI API ASR (fallback) -----------------
-import requests
 
 def transcribe_audio_openai(audio_path: str, model: str = "whisper-1", language: Optional[str] = None) -> List[dict]:
     if not OPENAI_API_KEY:
@@ -645,6 +704,7 @@ async def clip_endpoint(req: ClipRequest, background: BackgroundTasks):
     tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp_out_path = tmp_out.name; tmp_out.close()
     tmp_resized = None
+    tmp_bg_image = None
 
     loop = asyncio.get_event_loop()
     try:
@@ -661,21 +721,34 @@ async def clip_endpoint(req: ClipRequest, background: BackgroundTasks):
     try:
         res = parse_resolution(req.resolution)
         if res:
+            # ⭐ Download background image if URL provided
+            bg_path = BG_IMAGE_PATH
+            if req.background_image_url:
+                img_ext = req.background_image_url.split('?')[0].split('.')[-1].lower()
+                if img_ext not in ['jpg', 'jpeg', 'png', 'webp', 'bmp']:
+                    img_ext = 'jpg'
+                fd_bg, tmp_bg_image = tempfile.mkstemp(suffix=f".{img_ext}")
+                os.close(fd_bg)
+                await loop.run_in_executor(None, download_image_file, req.background_image_url, tmp_bg_image)
+                bg_path = tmp_bg_image
+            
             fd, tmp_resized = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
-            await loop.run_in_executor(None, resize_video_with_bg, tmp_out_path, tmp_resized, res, BG_IMAGE_PATH)
+            await loop.run_in_executor(None, resize_video_with_bg, tmp_out_path, tmp_resized, res, bg_path)
             final_output = tmp_resized
             background.add_task(remove_file_later, tmp_out_path)
+            if tmp_bg_image:
+                background.add_task(remove_file_later, tmp_bg_image)
         else:
             final_output = tmp_out_path
     except ValueError as ve:
-        for p in (tmp_download_path, tmp_out_path, tmp_resized):
+        for p in (tmp_download_path, tmp_out_path, tmp_resized, tmp_bg_image):
             if p:
                 try: os.remove(p)
                 except Exception: pass
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        for p in (tmp_download_path, tmp_out_path, tmp_resized):
+        for p in (tmp_download_path, tmp_out_path, tmp_resized, tmp_bg_image):
             if p:
                 try: os.remove(p)
                 except Exception: pass
@@ -702,6 +775,7 @@ async def clip_with_caption_endpoint(req: ClipCaptionRequest, background: Backgr
     tmp_video_resized = None
     tmp_music_path = None
     tmp_with_music = None
+    tmp_bg_image = None
 
     loop = asyncio.get_event_loop()
     try:
@@ -754,22 +828,35 @@ async def clip_with_caption_endpoint(req: ClipCaptionRequest, background: Backgr
     try:
         res = parse_resolution(req.resolution)
         if res:
+            # ⭐ Download background image if URL provided
+            bg_path = BG_IMAGE_PATH
+            if req.background_image_url:
+                img_ext = req.background_image_url.split('?')[0].split('.')[-1].lower()
+                if img_ext not in ['jpg', 'jpeg', 'png', 'webp', 'bmp']:
+                    img_ext = 'jpg'
+                fd_bg, tmp_bg_image = tempfile.mkstemp(suffix=f".{img_ext}")
+                os.close(fd_bg)
+                await loop.run_in_executor(None, download_image_file, req.background_image_url, tmp_bg_image)
+                bg_path = tmp_bg_image
+            
             fd, tmp_video_resized = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
-            await loop.run_in_executor(None, resize_video_with_bg, tmp_video_path, tmp_video_resized, res, BG_IMAGE_PATH)
+            await loop.run_in_executor(None, resize_video_with_bg, tmp_video_path, tmp_video_resized, res, bg_path)
             # keep resized path as input for subtitle steps
             working_video_for_sub = tmp_video_resized
         else:
             working_video_for_sub = tmp_video_path
     except ValueError as ve:
-        for p in (tmp_video_path, tmp_wav_path, tmp_ass_path, out_final_path, tmp_video_resized if tmp_video_resized else ""):
-            try: os.remove(p)
-            except Exception: pass
+        for p in (tmp_video_path, tmp_wav_path, tmp_ass_path, out_final_path, tmp_video_resized if tmp_video_resized else "", tmp_bg_image):
+            if p:
+                try: os.remove(p)
+                except Exception: pass
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        for p in (tmp_video_path, tmp_wav_path, tmp_ass_path, out_final_path, tmp_video_resized if tmp_video_resized else ""):
-            try: os.remove(p)
-            except Exception: pass
+        for p in (tmp_video_path, tmp_wav_path, tmp_ass_path, out_final_path, tmp_video_resized if tmp_video_resized else "", tmp_bg_image):
+            if p:
+                try: os.remove(p)
+                except Exception: pass
         logger.exception("resize failed")
         raise HTTPException(status_code=500, detail=f"resize failed: {e}")
 
@@ -841,7 +928,7 @@ async def clip_with_caption_endpoint(req: ClipCaptionRequest, background: Backgr
                 except: pass
 
     # schedule cleanup - clean all temp files EXCEPT final output
-    for p in (tmp_download_path, tmp_video_path, tmp_wav_path, tmp_ass_path, tmp_video_resized, tmp_music_path):
+    for p in (tmp_download_path, tmp_video_path, tmp_wav_path, tmp_ass_path, tmp_video_resized, tmp_music_path, tmp_bg_image):
         if p and os.path.exists(p):
             background.add_task(remove_file_later, p)
     
