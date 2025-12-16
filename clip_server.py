@@ -6,6 +6,8 @@ Changes:
  - Accept optional `resolution` (e.g. "1080x1920") in requests for /clip and /clip_with_caption
  - Resize/reencode output to requested resolution (scale+pad to preserve aspect ratio)
  - Resize before burning/embedding subtitles so final output matches requested size
+ - Accept optional background music URL and settings in /clip_with_caption
+ - Download and add background music to video, with volume and fade control
 
 Usage example request JSON:
 {
@@ -15,7 +17,10 @@ Usage example request JSON:
   "burn":true,
   "resolution":"1080x1920",
   "words_per_line":3,
-  "fontsize":64
+  "fontsize":64,
+  "background_music_url": "https://example.com/music.mp3",
+  "music_volume": 0.3,
+  "fade_music": true
 }
 
 How to run with caption:
@@ -27,7 +32,7 @@ How to run with caption:
    ```
    curl -X POST "http://localhost:8000/clip_with_caption" ^
      -H "Content-Type: application/json" ^
-     -d "{\"url\": \"https://www.youtube.com/watch?v=v52S3LBFZJs\", \"start\": 10, \"end\": 40, \"burn\": true, \"resolution\": \"1080x1920\"}" ^
+     -d "{\"url\": \"https://www.youtube.com/watch?v=v52S3LBFZJs\", \"start\": 10, \"end\": 40, \"burn\": true, \"resolution\": \"1080x1920\", \"background_music_url\": \"https://example.com/music.mp3\", \"music_volume\": 0.3, \"fade_music\": true}" ^
      --output output.mp4
    ```
    Or use the interactive docs at http://localhost:8000/docs
@@ -46,7 +51,7 @@ import importlib
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel, HttpUrl
 from fastapi.responses import FileResponse
 
@@ -81,6 +86,10 @@ class ClipCaptionRequest(ClipRequest):
     words_per_line: Optional[int] = 3
     fontsize: Optional[int] = 56
     margin_v: Optional[int] = 50
+    # ⭐ TAMBAHAN UNTUK BACKGROUND MUSIC
+    background_music_url: Optional[str] = None  # URL musik dari storage/CDN
+    music_volume: Optional[float] = 0.3  # Volume musik (0.0-1.0), 0.3 = 30%
+    fade_music: Optional[bool] = True  # Fade in/out musik
 
 # ----------------- Subprocess runner -----------------
 
@@ -275,6 +284,99 @@ def extract_audio_wav(input_video: str, out_wav: str):
         logger.error("extract audio failed: %s", cp.stderr or cp.stdout)
         raise RuntimeError("extract audio failed: " + (cp.stderr or cp.stdout or ""))
     logger.info("extracted audio: %s", out_wav)
+
+# ----------------- Audio mixing helpers -----------------
+def download_music_file(music_url: str, out_path: str):
+    """
+    Download music file from URL.
+    """
+    try:
+        logger.info("Downloading music from: %s", music_url)
+        resp = requests.get(music_url, stream=True, timeout=60)
+        resp.raise_for_status()
+        
+        with open(out_path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        logger.info("Downloaded music file to %s", out_path)
+    except Exception as e:
+        logger.error("Failed to download music: %s", e)
+        raise RuntimeError(f"Failed to download music: {e}")
+
+
+def add_background_music(
+    input_video: str,
+    music_path: str,
+    out_path: str,
+    music_volume: float = 0.3,
+    fade_duration: float = 2.0
+):
+    """
+    Add background music to video with volume control and fade in/out.
+    """
+    if not os.path.exists(music_path):
+        raise RuntimeError(f"Music file not found: {music_path}")
+    
+    music_path_norm = music_path.replace("\\", "/")
+    input_video_norm = input_video.replace("\\", "/")
+    
+    # Get video duration
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        input_video_norm
+    ]
+    probe_result = run_cmd(probe_cmd, timeout=30)
+    try:
+        video_duration = float(probe_result.stdout.strip())
+    except:
+        video_duration = 30.0
+    
+    logger.info("Video duration: %.2f seconds, adding music with volume: %.2f", video_duration, music_volume)
+    
+    # Audio filter: loop music, adjust volume, fade in/out, mix with original audio
+    if fade_duration > 0:
+        audio_filter = (
+            f"[1:a]aloop=loop=-1:size=2e+09,"
+            f"volume={music_volume},"
+            f"afade=t=in:st=0:d={fade_duration},"
+            f"afade=t=out:st={max(0, video_duration-fade_duration)}:d={fade_duration},"
+            f"atrim=0:{video_duration}[music];"
+            f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+        )
+    else:
+        audio_filter = (
+            f"[1:a]aloop=loop=-1:size=2e+09,"
+            f"volume={music_volume},"
+            f"atrim=0:{video_duration}[music];"
+            f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+        )
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_video_norm,
+        "-stream_loop", "-1",
+        "-i", music_path_norm,
+        "-filter_complex", audio_filter,
+        "-map", "0:v",
+        "-map", "[aout]",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        out_path
+    ]
+    
+    logger.info("Running ffmpeg to add background music...")
+    cp = run_cmd(cmd, timeout=600)
+    if cp.returncode != 0:
+        logger.error("add background music failed: %s", cp.stderr or cp.stdout)
+        raise RuntimeError("add background music failed: " + (cp.stderr or cp.stdout or ""))
+    
+    logger.info("Added background music to video -> %s", out_path)
+
 
 # ----------------- Local ASR helpers -----------------
 _HAS_FASTER = importlib.util.find_spec("faster_whisper") is not None
@@ -598,6 +700,8 @@ async def clip_with_caption_endpoint(req: ClipCaptionRequest, background: Backgr
     tmp_ass = tempfile.NamedTemporaryFile(delete=False, suffix=".ass"); tmp_ass_path = tmp_ass.name; tmp_ass.close()
     out_final = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4"); out_final_path = out_final.name; out_final.close()
     tmp_video_resized = None
+    tmp_music_path = None
+    tmp_with_music = None
 
     loop = asyncio.get_event_loop()
     try:
@@ -682,14 +786,74 @@ async def clip_with_caption_endpoint(req: ClipCaptionRequest, background: Backgr
         logger.exception("subtitle processing failed")
         raise HTTPException(status_code=500, detail=f"subtitle processing failed: {e}")
 
-    # schedule cleanup
-    for p in (tmp_video_path, tmp_wav_path, tmp_ass_path, tmp_video_resized) :
-        if p:
-            background.add_task(remove_file_later, p)
-    background.add_task(remove_file_later, out_final_path)
+    # ⭐ 6) TAMBAHKAN BACKGROUND MUSIC (OPTIONAL)
+    final_output_path = out_final_path
+    if req.background_music_url:
+        try:
+            logger.info("Processing background music from URL: %s", req.background_music_url)
+            
+            # Download music file
+            music_ext = req.background_music_url.split('?')[0].split('.')[-1].lower()
+            if music_ext not in ['mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac']:
+                music_ext = 'mp3'
+            
+            fd_music, tmp_music_path = tempfile.mkstemp(suffix=f".{music_ext}")
+            os.close(fd_music)
+            
+            logger.info("Downloading music to: %s", tmp_music_path)
+            await loop.run_in_executor(None, download_music_file, req.background_music_url, tmp_music_path)
+            
+            # Add music to video
+            fd_with_music, tmp_with_music = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd_with_music)
+            
+            fade_duration = 2.0 if req.fade_music else 0.0
+            music_volume = float(req.music_volume) if req.music_volume is not None else 0.3
+            
+            logger.info("Adding music with volume=%.2f, fade=%.1fs", music_volume, fade_duration)
+            await loop.run_in_executor(
+                None,
+                add_background_music,
+                out_final_path,
+                tmp_music_path,
+                tmp_with_music,
+                music_volume,
+                fade_duration
+            )
+            
+            # Update final output to the one with music
+            final_output_path = tmp_with_music
+            logger.info("Background music added successfully to: %s", final_output_path)
+            
+        except Exception as e:
+            logger.exception("Failed to add background music: %s", e)
+            # Continue without music if failed, cleanup temp files
+            final_output_path = out_final_path
+            if tmp_music_path and os.path.exists(tmp_music_path):
+                try: 
+                    os.remove(tmp_music_path)
+                    tmp_music_path = None
+                except: pass
+            if tmp_with_music and os.path.exists(tmp_with_music):
+                try: 
+                    os.remove(tmp_with_music)
+                    tmp_with_music = None
+                except: pass
 
-    filename = f"clip-caption-{Path(out_final_path).stem}.mp4"
-    return FileResponse(out_final_path, media_type="video/mp4", filename=filename)
+    # schedule cleanup - clean all temp files EXCEPT final output
+    for p in (tmp_download_path, tmp_video_path, tmp_wav_path, tmp_ass_path, tmp_video_resized, tmp_music_path):
+        if p and os.path.exists(p):
+            background.add_task(remove_file_later, p)
+    
+    # If we created a video with music, clean the one without music
+    if tmp_with_music and final_output_path == tmp_with_music and out_final_path != final_output_path:
+        background.add_task(remove_file_later, out_final_path)
+    
+    # Clean final output after response is sent
+    background.add_task(remove_file_later, final_output_path)
+
+    filename = f"clip-caption-{Path(final_output_path).stem}.mp4"
+    return FileResponse(final_output_path, media_type="video/mp4", filename=filename)
 
 @app.get("/health")
 async def health():
