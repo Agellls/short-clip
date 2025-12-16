@@ -224,11 +224,11 @@ def resize_video_with_bg(
     except:
         duration = 30.0  # fallback
 
-    # Add fade-in effect (0.3 seconds) to video for smooth transition
+    # Simplified filter_complex - remove fade effect if causing issues
     filter_complex = (
-        f"[0:v]scale=w=iw*min({w}/iw\\,{h}/ih):h=ih*min({w}/iw\\,{h}/ih),setsar=1,fade=in:st=0:d=0.3:alpha=1[vid];"
+        f"[0:v]scale=w=iw*min({w}/iw\\,{h}/ih):h=ih*min({w}/iw\\,{h}/ih),setsar=1[vid];"
         f"[1:v]scale={w}:{h},setsar=1,loop=loop=-1:size=1:start=0[bg];"
-        f"[bg][vid]overlay=(W-w)/2:(H-h)/2:shortest=1"
+        f"[bg][vid]overlay=(W-w)/2:(H-h)/2:shortest=1[out]"
     )
 
     cmd = [
@@ -236,6 +236,7 @@ def resize_video_with_bg(
         "-i", inp,
         "-loop", "1", "-t", str(duration), "-i", bg,
         "-filter_complex", filter_complex,
+        "-map", "[out]",
         "-map", "0:a?",
         "-c:v", "libx264",
         "-preset", "fast",
@@ -245,10 +246,32 @@ def resize_video_with_bg(
         out_path
     ]
 
+    logger.info("Running ffmpeg with background image: %s", " ".join(cmd))
     cp = run_cmd(cmd, timeout=600)
+    
     if cp.returncode != 0:
-        logger.error("resize with bg failed: %s", cp.stderr or cp.stdout)
-        raise RuntimeError("resize with bg failed")
+        logger.error("resize with bg failed - stdout: %s", cp.stdout)
+        logger.error("resize with bg failed - stderr: %s", cp.stderr)
+        
+        # Fallback to black padding if background fails
+        logger.warning("Falling back to black padding resize")
+        vf = (
+            f"scale=iw*min({w}/iw\\,{h}/ih):ih*min({w}/iw\\,{h}/ih),"
+            f"pad={w}:{h}:({w}-iw*min({w}/iw\\,{h}/ih))/2:({h}-ih*min({w}/iw\\,{h}/ih))/2:black"
+        )
+        cmd_fallback = [
+            "ffmpeg", "-y", "-i", inp,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "copy",
+            out_path
+        ]
+        cp_fallback = run_cmd(cmd_fallback, timeout=600)
+        if cp_fallback.returncode != 0:
+            logger.error("fallback resize also failed: %s", cp_fallback.stderr or cp_fallback.stdout)
+            raise RuntimeError("resize with bg and fallback both failed: " + (cp.stderr or cp.stdout or ""))
+        logger.info("Fallback resize successful")
+        return
 
     logger.info("Resized video with background to %dx%d -> %s", w, h, out_path)
 
@@ -986,7 +1009,7 @@ async def clip_with_caption_endpoint(req: ClipCaptionRequest, background: Backgr
             
         except Exception as e:
             logger.exception("Failed to add background music: %s", e)
-            # Continue without music if failed, cleanup temp files
+            # Continue tanpa musik jika gagal, cleanup temp files
             final_output_path = out_final_path
             if tmp_music_path and os.path.exists(tmp_music_path):
                 try: 
