@@ -24,8 +24,8 @@ COPY .env* ./
 # Create necessary directories
 RUN mkdir -p assets temp
 
-# Copy assets folder (will skip if doesn't exist)
-COPY assets/ assets/ 2>/dev/null || true
+# Copy assets folder (will fail build if doesn't exist - remove if optional)
+COPY assets/ assets/
 
 # Expose port
 EXPOSE 8000
@@ -35,4 +35,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
 
 # Start uvicorn server
+
 CMD ["uvicorn", "clip_server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
